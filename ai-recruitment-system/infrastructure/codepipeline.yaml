@@ -1,0 +1,436 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AI採用システムのCI/CDパイプライン'
+
+# テンプレートパラメータ
+Parameters:
+  StackName:
+    Type: String
+    Default: ai-recruitment-system
+    Description: メインスタックの名前
+
+  Environment:
+    Type: String
+    Default: Development
+    AllowedValues:
+      - Development
+      - Staging
+      - Production
+    Description: デプロイ環境（開発、ステージング、本番）
+
+  GitHubOwner:
+    Type: String
+    Description: GitHubリポジトリの所有者
+
+  GitHubRepo:
+    Type: String
+    Default: ai-recruitment-system
+    Description: GitHubリポジトリ名
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: デプロイするGitHubブランチ
+
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHubの個人アクセストークン
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: パイプラインの通知を受け取るメールアドレス（空白の場合は通知なし）
+
+Mappings:
+  EnvironmentMap:
+    Development:
+      Prefix: dev
+    Staging:
+      Prefix: stg
+    Production:
+      Prefix: prod
+
+# リソース定義
+Resources:
+  # ====================
+  # S3 バケット
+  # ====================
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${StackName}-artifacts-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ====================
+  # IAM リソース
+  # ====================
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackName}-pipeline-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeStarFullAccess
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:ValidateTemplate
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: '*'
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackName}-codebuild-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/AmazonLambdaFullAccess
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: '*'
+
+  # ====================
+  # CodeBuild プロジェクト
+  # ====================
+  BackendBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${StackName}-backend-build'
+      Description: 'NeoCreaバックエンドビルドプロジェクト'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: STACK_NAME
+            Value: !Ref StackName
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: backend/buildspec.yml
+      TimeoutInMinutes: 15
+      Cache:
+        Type: S3
+        Location: !Sub '${ArtifactBucket.Arn}/codebuild-cache'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  FrontendBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${StackName}-frontend-build'
+      Description: 'NeoCreaフロントエンドビルドプロジェクト'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: STACK_NAME
+            Value: !Ref StackName
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          # API EndpointとCognitoの設定
+          - Name: REACT_APP_API_ENDPOINT
+            Value: !Sub '{{resolve:ssm:/${StackName}/ApiEndpoint:1}}'
+          - Name: REACT_APP_USER_POOL_ID
+            Value: !Sub '{{resolve:ssm:/${StackName}/UserPoolId:1}}'
+          - Name: REACT_APP_USER_POOL_CLIENT_ID
+            Value: !Sub '{{resolve:ssm:/${StackName}/UserPoolClientId:1}}'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: frontend/buildspec.yml
+      TimeoutInMinutes: 15
+      Cache:
+        Type: S3
+        Location: !Sub '${ArtifactBucket.Arn}/codebuild-cache'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  AIModelBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${StackName}-ai-model-build'
+      Description: 'NeoCrea AIモデルビルドプロジェクト'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: STACK_NAME
+            Value: !Ref StackName
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ai_model/buildspec.yml
+      TimeoutInMinutes: 30
+      Cache:
+        Type: S3
+        Location: !Sub '${ArtifactBucket.Arn}/codebuild-cache'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ====================
+  # CodePipeline
+  # ====================
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${StackName}-pipeline'
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        # ソースコードの取得
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: '1'
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+              OutputArtifacts:
+                - Name: SourceCode
+
+        # バックエンドのビルド
+        - Name: BackendBuild
+          Actions:
+            - Name: BuildBackend
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BackendBuildProject
+              InputArtifacts:
+                - Name: SourceCode
+              OutputArtifacts:
+                - Name: BackendBuildOutput
+
+        # AIモデルのビルド
+        - Name: AIModelBuild
+          Actions:
+            - Name: BuildAIModel
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref AIModelBuildProject
+              InputArtifacts:
+                - Name: SourceCode
+              OutputArtifacts:
+                - Name: AIModelBuildOutput
+
+        # フロントエンドのビルド
+        - Name: FrontendBuild
+          Actions:
+            - Name: BuildFrontend
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref FrontendBuildProject
+              InputArtifacts:
+                - Name: SourceCode
+              OutputArtifacts:
+                - Name: FrontendBuildOutput
+
+        # インフラストラクチャのデプロイ
+        - Name: Deploy
+          Actions:
+            - Name: DeployCloudFormation
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Ref StackName
+                TemplatePath: SourceCode::infrastructure/cloudformation-template.yaml
+                Capabilities: CAPABILITY_NAMED_IAM
+                ParameterOverrides: !Sub |
+                  {
+                    "Environment": "${Environment}",
+                    "CodeDeploymentBucket": "${ArtifactBucket}"
+                  }
+              InputArtifacts:
+                - Name: SourceCode
+
+            - Name: DeployFrontend
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                BucketName: !Sub '{{resolve:ssm:/${StackName}/FrontendBucketName:1}}'
+                Extract: true
+              InputArtifacts:
+                - Name: FrontendBuildOutput
+              RunOrder: 2
+
+  # ====================
+  # 通知
+  # ====================
+  PipelineNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      DisplayName: !Sub '${StackName} Pipeline Notifications'
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  PipelineNotificationRule:
+    Type: AWS::CodeStarNotifications::NotificationRule
+    Condition: HasNotificationEmail
+    Properties:
+      Name: !Sub '${StackName}-pipeline-notification'
+      DetailType: FULL
+      EventTypeIds:
+        - codepipeline-pipeline-pipeline-execution-failed
+        - codepipeline-pipeline-pipeline-execution-succeeded
+        - codepipeline-pipeline-manual-approval-needed
+      Resource: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}'
+      Targets:
+        - TargetType: SNS
+          TargetAddress: !Ref PipelineNotificationTopic
+
+# 条件
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+
+# 出力
+Outputs:
+  PipelineUrl:
+    Description: CI/CDパイプラインのURL
+    Value: !Sub 'https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}'
+
+  ArtifactBucketName:
+    Description: パイプラインアーティファクト用S3バケット
+    Value: !Ref ArtifactBucket
+
+  CodeBuildBackendProject:
+    Description: バックエンドビルドプロジェクト
+    Value: !Ref BackendBuildProject
+
+  CodeBuildFrontendProject:
+    Description: フロントエンドビルドプロジェクト
+    Value: !Ref FrontendBuildProject
+
+  CodeBuildAIModelProject:
+    Description: AIモデルビルドプロジェクト
+    Value: !Ref AIModelBuildProject

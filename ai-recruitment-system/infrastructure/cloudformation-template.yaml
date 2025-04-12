@@ -1,0 +1,733 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AI採用システムのCloudFormationテンプレート - メインインフラストラクチャ定義'
+
+# テンプレートパラメータ
+Parameters:
+  Environment:
+    Type: String
+    Default: Development
+    AllowedValues:
+      - Development
+      - Staging
+      - Production
+    Description: デプロイ環境（開発、ステージング、本番）
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: アプリケーションが配置されるVPC ID
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: アプリケーションが配置されるサブネットIDs（カンマ区切り）
+
+  DomainName:
+    Type: String
+    Default: ''
+    Description: フロントエンドのドメイン名（空白の場合、CloudFrontから生成されたURLが使用されます）
+
+  CodeDeploymentBucket:
+    Type: String
+    Default: ''
+    Description: Lambda関数のコードが保存されているS3バケット名
+
+  SageMakerEndpointName:
+    Type: String
+    Default: interview-feedback-endpoint
+    Description: SageMakerエンドポイント名
+
+  SenderEmailAddress:
+    Type: String
+    Default: recruitment@example.com
+    Description: フォローアップメールの送信元アドレス
+
+  AcmCertificateArn:
+    Type: String
+    Default: ''
+    Description: カスタムドメインのACM証明書ARN（カスタムドメインがある場合）
+
+# メタデータ（AWS CloudFormation Designer）
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'デプロイ設定'
+        Parameters:
+          - Environment
+      - Label:
+          default: 'ネットワーク設定'
+        Parameters:
+          - VpcId
+          - SubnetIds
+      - Label:
+          default: 'ドメイン設定'
+        Parameters:
+          - DomainName
+
+# リソースを環境ごとに識別するためのリソース接頭辞を生成する関数
+Mappings:
+  EnvironmentMap:
+    Development:
+      Prefix: dev
+    Staging:
+      Prefix: stg
+    Production:
+      Prefix: prod
+
+# リソース定義
+Resources:
+  # ====================
+  # IAM リソース
+  # ====================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-LambdaExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !GetAtt CandidatesTable.Arn
+                  - !GetAtt JobsTable.Arn
+                  - !GetAtt InterviewsTable.Arn
+                  - !GetAtt PredictionsTable.Arn
+                  - !GetAtt FeedbackTable.Arn
+                  - !GetAtt EmailHistoryTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${TranscriptsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - comprehend:DetectSentiment
+                  - comprehend:DetectKeyPhrases
+                  - comprehend:DetectDominantLanguage
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sagemaker:InvokeEndpoint
+                Resource: '*'
+
+  # ====================
+  # DynamoDB テーブル
+  # ====================
+  CandidatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-Candidates'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-Jobs'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  InterviewsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-Interviews'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: candidateId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CandidateIdIndex
+          KeySchema:
+            - AttributeName: candidateId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  PredictionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-Predictions'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  FeedbackTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-Feedback'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  EmailHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-EmailHistory'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: emailId
+          AttributeType: S
+        - AttributeName: candidateId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: emailId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CandidateIdIndex
+          KeySchema:
+            - AttributeName: candidateId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ====================
+  # S3 バケット
+  # ====================
+  TranscriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-interview-transcripts-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-frontend-${AWS::AccountId}'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ====================
+  # Lambda 関数
+  # ====================
+  RecruitmentPredictionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-recruitment-prediction'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref CodeDeploymentBucket
+        S3Key: lambda/recruitment-prediction.zip
+      Environment:
+        Variables:
+          CANDIDATES_TABLE: !Ref CandidatesTable
+          JOBS_TABLE: !Ref JobsTable
+          INTERVIEWS_TABLE: !Ref InterviewsTable
+          PREDICTIONS_TABLE: !Ref PredictionsTable
+          REGION: !Ref AWS::Region
+      MemorySize: 256
+      Timeout: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  InterviewFeedbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-interview-feedback'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref CodeDeploymentBucket
+        S3Key: lambda/interview-feedback.zip
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT_NAME: !Ref SageMakerEndpointName
+          INTERVIEWS_TABLE: !Ref InterviewsTable
+          FEEDBACK_TABLE: !Ref FeedbackTable
+          TRANSCRIPTS_BUCKET: !Ref TranscriptsBucket
+          ENABLE_SENTIMENT_ANALYSIS: true
+          REGION: !Ref AWS::Region
+      MemorySize: 512
+      Timeout: 60
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  CultureMatchingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-culture-matching'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref CodeDeploymentBucket
+        S3Key: lambda/culture-matching.zip
+      Environment:
+        Variables:
+          CANDIDATES_TABLE: !Ref CandidatesTable
+          JOBS_TABLE: !Ref JobsTable
+          REGION: !Ref AWS::Region
+      MemorySize: 256
+      Timeout: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  AutoFollowUpFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-auto-follow-up'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref CodeDeploymentBucket
+        S3Key: lambda/auto-follow-up.zip
+      Environment:
+        Variables:
+          EMAIL_HISTORY_TABLE: !Ref EmailHistoryTable
+          SENDER_EMAIL: !Ref SenderEmailAddress
+          REGION: !Ref AWS::Region
+      MemorySize: 256
+      Timeout: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # DynamoDBストリームをLambda関数にマッピング
+  CandidatesTableEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt CandidatesTable.StreamArn
+      FunctionName: !GetAtt AutoFollowUpFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 10
+      Enabled: true
+
+  # ====================
+  # API Gateway
+  # ====================
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      Description: 'AI採用システムAPI'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gatewayのリソースとメソッド（簡略化のため主要なエンドポイントのみ定義）
+  # 採用予測APIリソース
+  PredictionResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'prediction'
+
+  PredictionMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref PredictionResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RecruitmentPredictionFunction.Arn}/invocations'
+
+  # 面接フィードバックAPIリソース
+  FeedbackResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'feedback'
+
+  FeedbackMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref FeedbackResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${InterviewFeedbackFunction.Arn}/invocations'
+
+  # 文化マッチングAPIリソース
+  CultureResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'culture-matching'
+
+  CultureMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref CultureResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CultureMatchingFunction.Arn}/invocations'
+
+  # APIのデプロイ
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PredictionMethod
+      - FeedbackMethod
+      - CultureMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  # APIステージ
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiDeployment
+      StageName: !FindInMap [EnvironmentMap, !Ref Environment, Prefix]
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          DataTraceEnabled: true
+          LoggingLevel: INFO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ====================
+  # Cognito User Pool
+  # ====================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-user-pool'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: OFF
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+      UsernameAttributes:
+        - email
+      UserPoolTags:
+        Environment: !Ref Environment
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${AWS::StackName}-app-client'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlows:
+        - implicit
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      CallbackURLs:
+        - !If [HasDomain, !Sub 'https://${DomainName}', !Sub 'https://${CloudFrontDistribution.DomainName}']
+      LogoutURLs:
+        - !If [HasDomain, !Sub 'https://${DomainName}', !Sub 'https://${CloudFrontDistribution.DomainName}']
+      SupportedIdentityProviders:
+        - COGNITO
+
+  ApiAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub '${AWS::StackName}-api-authorizer'
+      RestApiId: !Ref ApiGateway
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt UserPool.Arn
+
+  # ====================
+  # CloudFront Distribution
+  # ====================
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.DomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOriginAccessIdentity}'
+          - Id: ApiOrigin
+            DomainName: !Sub '${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com'
+            OriginPath: !Sub '/${ApiStage}'
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods:
+              - DELETE
+              - GET
+              - HEAD
+              - OPTIONS
+              - PATCH
+              - POST
+              - PUT
+            CachedMethods:
+              - GET
+              - HEAD
+            ForwardedValues:
+              QueryString: true
+              Headers:
+                - Authorization
+              Cookies:
+                Forward: all
+            MinTTL: 0
+            DefaultTTL: 0
+            MaxTTL: 0
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: !If [HasDomain, 'false', 'true']
+          AcmCertificateArn: !If [HasDomain, !Ref AcmCertificateArn, !Ref 'AWS::NoValue']
+          SslSupportMethod: !If [HasDomain, 'sni-only', !Ref 'AWS::NoValue']
+          MinimumProtocolVersion: TLSv1.2_2019
+        Aliases: !If [HasDomain, [!Ref DomainName], !Ref 'AWS::NoValue']
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        IPV6Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'Access identity for ${AWS::StackName}'
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOriginAccessIdentity.S3CanonicalUserId
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+
+  # ====================
+  # SageMaker Endpoint
+  # ====================
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-SageMakerExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+# 条件
+Conditions:
+  HasDomain: !Not [!Equals [!Ref DomainName, '']]
+
+# 出力
+Outputs:
+  ApiEndpoint:
+    Description: API Gatewayエンドポイント
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}'
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+
+  CloudFrontDistributionId:
+    Description: CloudFront Distribution ID
+    Value: !Ref CloudFrontDistribution
+
+  CloudFrontDomainName:
+    Description: CloudFront Distribution Domain Name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  TranscriptsBucketName:
+    Description: 面接トランスクリプト保存用S3バケット
+    Value: !Ref TranscriptsBucket
+
+  FrontendBucketName:
+    Description: フロントエンド用S3バケット
+    Value: !Ref FrontendBucket
+
+  CandidatesTableName:
+    Description: 候補者データ用DynamoDBテーブル
+    Value: !Ref CandidatesTable
+
+  JobsTableName:
+    Description: 求人情報用DynamoDBテーブル
+    Value: !Ref JobsTable
+
+  InterviewsTableName:
+    Description: 面接データ用DynamoDBテーブル
+    Value: !Ref InterviewsTable
+
+  PredictionsTableName:
+    Description: 採用予測用DynamoDBテーブル
+    Value: !Ref PredictionsTable
+
+  FeedbackTableName:
+    Description: 面接フィードバック用DynamoDBテーブル
+    Value: !Ref FeedbackTable
+
+  EmailHistoryTableName:
+    Description: メール送信履歴用DynamoDBテーブル
+    Value: !Ref EmailHistoryTable
